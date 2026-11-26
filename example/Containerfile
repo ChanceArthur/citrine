@@ -1,0 +1,21 @@
+FROM docker.io/library/node:lts-slim AS build
+WORKDIR /app
+ENV ASTRO_TELEMETRY_DISABLED=1
+ENV EMDASH_SITE_URL=https://example.com
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+FROM docker.io/library/node:lts-slim AS runtime
+WORKDIR /app
+ENV NODE_ENV=production
+ENV HOST=0.0.0.0
+ENV PORT=4321
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY --from=build /app/dist ./dist
+RUN mkdir data && chown node:node data
+USER node
+EXPOSE 4321
+CMD ["node", "./dist/server/entry.mjs"]

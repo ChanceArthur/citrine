@@ -1,0 +1,17 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+mountpoint -q "$POOL_MOUNT" || exit 0
+seed=$(readlink -f "$POOL_SEED_PART" 2>/dev/null || true)
+
+if btrfs filesystem show "$POOL_MOUNT" | grep -q 'devices missing'; then
+  log "the pool came back short a device"
+  if [ -b "$seed" ] && ! btrfs filesystem show "$POOL_MOUNT" | grep -qE "path $seed$"; then
+    log "adding $seed before dropping the missing one"
+    btrfs device add -f "$seed" "$POOL_MOUNT"
+  fi
+  btrfs device delete missing "$POOL_MOUNT" ||
+    log "could not drop the missing device — the pool stays degraded"
+fi
+
+mirror_pool

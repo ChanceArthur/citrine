@@ -1,0 +1,13 @@
+[Unit]
+Description=Fetch the site and apply and build what changed
+After=network-online.target citrine-pool.service citrine-first-boot.service
+Wants=network-online.target
+ConditionPathExists=/var/lib/citrine/first-boot.done
+
+[Service]
+Type=oneshot
+TimeoutStartSec=1h
+ExecStart=/usr/libexec/citrine/site sync
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Heal the Citrine data pool back to RAID1
+After=citrine-pool.service
+Requires=citrine-pool.service
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=/usr/libexec/citrine/pool-heal
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

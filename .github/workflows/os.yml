@@ -1,0 +1,65 @@
+name: OS
+
+on:
+  schedule:
+    - cron: "23 12 * * 5"
+      timezone: "America/New_York"
+  workflow_dispatch:
+
+concurrency:
+  group: os
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/chancearthur/citrine
+
+jobs:
+  base:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Check
+        run: |
+          git ls-files -z | xargs -0 grep -lE '^#!.*(bash|sh)$' |
+            xargs shellcheck -S warning tree/usr/lib/citrine/conf.sh tree/usr/libexec/citrine/common
+          for t in pool app setup secrets conf; do bash .github/test/test-$t.sh; done
+
+      - name: Version
+        run: echo "VERSION=$(TZ=America/New_York date +%y.%m.%d.%H%M%S)" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          COMMIT: ${{ github.sha }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: ./.github/build/os.sh && podman tag "$IMAGE:latest" "$IMAGE:$VERSION" "$IMAGE:$GITHUB_SHA"
+
+      - run: podman login ghcr.io -u ${{ github.actor }} --password-stdin <<< "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Sign and push
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          SIGNING_PASSWORD: ${{ secrets.SIGNING_PASSWORD }}
+        run: |
+          if [ -z "$SIGNING_KEY" ] || [ -z "$SIGNING_PASSWORD" ]; then
+            echo "SIGNING_KEY and SIGNING_PASSWORD are unset, and every server refuses an unsigned Citrine."
+            exit 1
+          fi
+          printf '%s\n' "$SIGNING_KEY" >"$RUNNER_TEMP/signing.key"
+          printf '%s' "$SIGNING_PASSWORD" >"$RUNNER_TEMP/signing.pass"
+          sign=(--sign-by-sigstore-private-key "$RUNNER_TEMP/signing.key" --sign-passphrase-file "$RUNNER_TEMP/signing.pass")
+
+          mkdir -p ~/.config/containers/registries.d
+          cp tree/etc/containers/registries.d/citrine.yaml ~/.config/containers/registries.d/
+          jq --arg image "$IMAGE" --arg key "$PWD/tree/usr/lib/citrine/signing.pub" \
+            '(.transports.docker[$image][] | select(.type == "sigstoreSigned")).keyPath = $key' \
+            tree/etc/containers/policy.json >"$RUNNER_TEMP/policy.json"
+
+          podman push "${sign[@]}" "$IMAGE:$VERSION"
+          podman push "${sign[@]}" "$IMAGE:$GITHUB_SHA"
+          skopeo --policy "$RUNNER_TEMP/policy.json" copy --preserve-digests \
+            "docker://$IMAGE:$VERSION" "docker://$IMAGE:latest"

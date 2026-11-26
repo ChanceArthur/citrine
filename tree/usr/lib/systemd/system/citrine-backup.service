@@ -1,0 +1,9 @@
+[Unit]
+Description=Back up the databases and chosen paths to R2
+After=citrine-first-boot.service
+ConditionPathExists=/var/lib/citrine/first-boot.done
+
+[Service]
+Type=oneshot
+TimeoutStartSec=2h
+ExecStart=/usr/libexec/citrine/backup r2

@@ -1,0 +1,1 @@
+#1001 ALL=(root) NOPASSWD: /usr/libexec/citrine/look, /usr/libexec/citrine/setup

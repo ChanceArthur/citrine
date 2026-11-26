@@ -1,0 +1,274 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+usage='usage: citrine-app show <image>
+       citrine-app install <image> [--join <container,...>] [--env <file,...>] [--yes]
+       citrine-app remove <name>
+       citrine-app list
+       citrine-app restore'
+
+bundle=/usr/share/citrine-app
+state=$POOL_MOUNT/citrine-apps
+quadlets=/etc/containers/systemd/users/$USER_UID
+envdir=/etc/citrine/env
+word='^[a-z0-9][a-z0-9-]*$'
+envname='^[a-z0-9][a-z0-9.-]*$'
+path='^[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)*$'
+
+shopt -s nullglob
+
+die() {
+  printf 'citrine: %s\n' "$*" | cat -v >&2
+  exit 1
+}
+
+field() { sed -n "s/^$2=//p" "$1" | tail -n 1; }
+
+needs_root() { [ "$(id -u)" = 0 ] || die "citrine-app $1 needs root"; }
+
+fetch() {
+  local image=$1 id
+  [[ $image =~ ^[A-Za-z0-9][A-Za-z0-9./_:@-]*$ ]] || die "$image isn't an image reference"
+  dir=$(mktemp -d /var/tmp/citrine-app.XXXXXX)
+  stage=$dir
+  trap 'rm -rf "$dir" "$stage"' EXIT
+  if [ "$(id -u)" = 0 ]; then
+    stage=$(mktemp -d /var/tmp/citrine-app.XXXXXX)
+    chown "$USER_UID" "$stage"
+  fi
+
+  as_user podman pull -q "$image" >/dev/null
+  id=$(as_user podman create "$image")
+  if ! as_user podman cp "$id:$bundle/." "$stage/"; then
+    as_user podman rm "$id" >/dev/null
+    die "$image carries no $bundle"
+  fi
+  as_user podman rm "$id" >/dev/null
+  [ "$stage" = "$dir" ] || cp -R "$stage/." "$dir/"
+  check
+}
+
+check() {
+  local f p
+  [ -f "$dir/app.conf" ] && [ ! -L "$dir/app.conf" ] || die "the image has no app.conf"
+  name=$(field "$dir/app.conf" NAME)
+  serve=$(field "$dir/app.conf" SERVE)
+  backup=$(field "$dir/app.conf" BACKUP)
+  backup_exclude=$(field "$dir/app.conf" BACKUP_EXCLUDE)
+
+  [[ $name =~ $word ]] || die "app.conf's NAME isn't a name: $name"
+  [ -d "$dir/units" ] && [ ! -L "$dir/units" ] || die "the image has no units/"
+  [ -f "$dir/units/$name.container" ] || die "the image has no units/$name.container"
+
+  units=
+  for f in "$dir/units"/*; do
+    p=${f##*/}
+    [ -f "$f" ] && [ ! -L "$f" ] || die "units/$p isn't a plain file"
+    [[ $p =~ ^[a-z0-9][a-z0-9-]*\.(container|network|volume)$ ]] || die "units/$p isn't a quadlet"
+    units+=" $p"
+  done
+  pool_paths=$(sed -n 's|^Volume=@POOL@/\([^:]*\):.*|\1|p' "$dir/units"/*.container | sort -u | tr '\n' ' ')
+  pool_paths=${pool_paths% }
+  [[ "$serve $backup $backup_exclude $pool_paths" != *[][*?\\]* ]] || die "app.conf and the units' volumes can't use wildcards"
+  for p in $serve; do
+    [[ $p =~ ^[0-9]+=[0-9]+$ ]] || die "SERVE wants <port>=<port>: $p"
+  done
+  for p in $pool_paths $backup $backup_exclude; do
+    [[ $p =~ $path ]] && [[ /$p/ != */../* && /$p/ != */./* ]] || die "not a path inside the pool: $p"
+  done
+  for p in $backup $backup_exclude; do
+    [[ $p == "$name" || $p == "$name"/* ]] || die "$p isn't inside the app's own $name/ on the pool"
+  done
+}
+
+summary() {
+  local image=$1 f
+  echo "$name, from $image"
+  echo "  units:         ${units# }"
+  [ -z "$pool_paths" ] || echo "  on the pool:   $pool_paths"
+  [ -z "$backup" ] || echo "  backed up:     $backup"
+  [ -z "$backup_exclude" ] || echo "  not backed up: $backup_exclude"
+  [ -z "$serve" ] || echo "  on the tailnet: $serve"
+  for f in Image PublishPort Volume AddDevice EnvironmentFile PodmanArgs; do
+    grep -h "^$f=" "$dir/units"/* | cat -v | sed 's/^/  /' || true
+  done
+}
+
+record_of() { echo "$state/$1"; }
+
+install_app() {
+  local image='' join='' envs='' yes='' expect='' t f p changed=()
+  while [ $# -gt 0 ]; do
+    case $1 in
+      --join) join=${2:?--join wants containers} && shift ;;
+      --env) envs=${2:?--env wants files} && shift ;;
+      --yes) yes=1 ;;
+      --expect) expect=${2:?--expect wants a name} && shift ;;
+      -*) die "$usage" ;;
+      *)
+        [ -z "$image" ] || die "$usage"
+        image=$1
+        ;;
+    esac
+    shift
+  done
+  [ -n "$image" ] || die "$usage"
+  needs_root install
+  mountpoint -q "$POOL_MOUNT" || die "the pool isn't mounted"
+
+  join=${join//,/ }
+  envs=${envs//,/ }
+  for t in $join; do
+    [[ $t =~ $word ]] && [ -f "$quadlets/$t.container" ] || die "no container called $t to join"
+  done
+  for f in $envs; do
+    [[ $f =~ $envname ]] && [ -f "$envdir/$f" ] || die "no $envdir/$f"
+  done
+
+  fetch "$image"
+  [ -z "$expect" ] || [ "$name" = "$expect" ] || die "$image now calls itself $name, not $expect"
+
+  local record owned=
+  record=$(record_of "$name")
+  [ ! -f "$record" ] || owned=" $(field "$record" UNITS) "
+  [ -z "$join" ] || units+=" $name.network"
+  for p in $units; do
+    [ ! -e "$quadlets/$p" ] || [[ $owned == *" $p "* ]] || die "$p is already on this machine and isn't $name's"
+  done
+  if [ -n "$backup$backup_exclude" ]; then
+    for p in ${BACKUP_PATHS:-} ${BACKUP_DRIVE_PATHS:-}; do
+      [ "${p%%/*}" != "$name" ] || die "$name/ on the pool is already backed up as something else's"
+    done
+    for f in "$quadlets"/*.container; do
+      [[ $owned == *" ${f##*/} "* ]] && continue
+      ! grep -q "^Volume=$POOL_MOUNT/${name}[/:]" "$f" || die "$name/ on the pool is ${f##*/}'s"
+    done
+  fi
+  for p in $serve; do
+    [[ " ${SERVE:-} ${SERVE_TCP:-} " != *" ${p%%=*}="* ]] || die "the site already serves port ${p%%=*}"
+    for f in "$state"/*; do
+      [ "$f" = "$record" ] || [[ " $(field "$f" SERVE) " != *" ${p%%=*}="* ]] || die "${f##*/} already serves port ${p%%=*}"
+    done
+  done
+
+  if [ -z "$yes" ]; then
+    summary "$image"
+    [ -z "$join" ] || echo "  joins:         $join, which restart"
+    [ -z "$envs" ] || echo "  env files:     $envs"
+    local answer=
+    read -r -p "Install it? It can read whatever $USER_NAME can. [y/N] " answer </dev/tty
+    [[ $answer == [yY]* ]] || exit 0
+  fi
+
+  local tailnet_host
+  tailnet_host=$(tailscale status --json 2>/dev/null | jq -r '.Self.DNSName // empty' | sed 's/\.$//') || tailnet_host=
+  for f in "$dir/units"/*; do
+    sed -i -e "s|@POOL@|$POOL_MOUNT|g" -e "s|@HOST@|$HOSTNAME|g" -e "s|@TAILNET_HOST@|$tailnet_host|g" "$f"
+  done
+
+  local main=$dir/units/$name.container
+  [ -z "$join" ] || sed -i -e "/^\[Container\]/a Network=$name.network" "$main"
+  for t in $join; do
+    sed -i -e "/^\[Unit\]/a After=$t.service" -e "/^\[Unit\]/a Wants=$t.service" "$main"
+  done
+  for f in $envs; do
+    sed -i -e "/^\[Container\]/a EnvironmentFile=$envdir/$f" "$main"
+  done
+  [ -z "$join" ] || printf '[Network]\nNetworkName=%s\n' "$name" >"$dir/units/$name.network"
+
+  for p in $pool_paths; do
+    [ -d "$POOL_MOUNT/$p" ] || pool_dir "$p" || die "couldn't make $p on the pool"
+  done
+
+  for f in "$dir/units"/*; do
+    install -m 0644 -o root -g root "$f" "$quadlets/${f##*/}"
+  done
+  for t in $join; do
+    install -d "$quadlets/$t.container.d"
+    rm -f "$dir/join"
+    printf '[Container]\nNetwork=%s.network\n' "$name" >"$dir/join"
+    cmp -s "$dir/join" "$quadlets/$t.container.d/app-$name.conf" && continue
+    install -m 0644 "$dir/join" "$quadlets/$t.container.d/app-$name.conf"
+    changed+=("$t.service")
+  done
+
+  if [ -n "$serve" ]; then
+    if tailscale status >/dev/null 2>&1; then
+      for p in $serve; do tailscale serve --bg --https="${p%%=*}" "${p##*=}"; done
+    else
+      log "tailscale isn't up, so $serve wait for the next 'citrine-app restore'"
+    fi
+  fi
+
+  install -d -m 0755 -o root -g root "$state"
+  {
+    echo "IMAGE=$image"
+    echo "JOIN=$join"
+    echo "ENV=$envs"
+    echo "UNITS=${units# }"
+    echo "SERVE=$serve"
+    echo "BACKUP=$backup"
+    echo "BACKUP_EXCLUDE=$backup_exclude"
+  } >"$record"
+
+  as_user systemctl --user daemon-reload
+  [ ${#changed[@]} -eq 0 ] || as_user systemctl --user restart --no-block "${changed[@]}"
+  as_user systemctl --user restart --no-block "$name.service"
+  log "$name is starting"
+}
+
+remove_app() {
+  name=${1:?$usage}
+  needs_root remove
+  [[ $name =~ $word ]] || die "$name isn't a name"
+  local record t p
+  record=$(record_of "$name")
+  [ -f "$record" ] || die "no app called $name"
+
+  as_user systemctl --user stop "$name.service" || true
+  for p in $(field "$record" UNITS); do rm -f "$quadlets/$p"; done
+  for t in $(field "$record" JOIN); do rm -f "$quadlets/$t.container.d/app-$name.conf"; done
+  if tailscale status >/dev/null 2>&1; then
+    for p in $(field "$record" SERVE); do tailscale serve --https="${p%%=*}" off || true; done
+  fi
+  as_user systemctl --user daemon-reload
+  for t in $(field "$record" JOIN); do
+    as_user systemctl --user restart --no-block "$t.service"
+  done
+  rm -f "$record"
+  log "$name is gone; what it kept on the pool stays"
+}
+
+list_apps() {
+  local f
+  for f in "$state"/*; do
+    printf '%s\t%s\n' "${f##*/}" "$(field "$f" IMAGE)"
+  done
+}
+
+restore_apps() {
+  needs_root restore
+  local f args=() j e
+  for f in "$state"/*; do
+    args=("$(field "$f" IMAGE)" --yes --expect "${f##*/}")
+    j=$(field "$f" JOIN)
+    e=$(field "$f" ENV)
+    [ -z "$j" ] || args+=(--join "${j// /,}")
+    [ -z "$e" ] || args+=(--env "${e// /,}")
+    "$0" install "${args[@]}" || log "couldn't restore ${f##*/}"
+  done
+}
+
+case ${1:-} in
+  show)
+    fetch "${2:?$usage}"
+    summary "$2"
+    echo
+    cat -v "$dir/units"/*
+    ;;
+  install) shift && install_app "$@" ;;
+  remove) remove_app "${2:-}" ;;
+  list) list_apps ;;
+  restore) restore_apps ;;
+  *) die "$usage" ;;
+esac

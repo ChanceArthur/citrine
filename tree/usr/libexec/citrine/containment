@@ -1,0 +1,13 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+subuid=/etc/subuid
+uids=/run/citrine/containment-uids.nft
+
+name=$(id -un "$USER_UID" 2>/dev/null || echo "$USER_NAME")
+ranges=$(awk -F: -v name="$name" -v uid="$USER_UID" '
+  ($1 == name || $1 == uid) && $2 ~ /^[0-9]+$/ && $3 ~ /^[1-9][0-9]*$/ { printf ", %.0f-%.0f", $2, $2 + $3 - 1 }' "$subuid")
+
+install -d "${uids%/*}"
+printf 'define user_uids = { %s%s }\n' "$USER_UID" "$ranges" >"$uids"
+exec nft -f /etc/citrine/containment.nft

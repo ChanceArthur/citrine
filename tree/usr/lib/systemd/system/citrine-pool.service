@@ -1,0 +1,13 @@
+[Unit]
+Description=Citrine data pool
+After=local-fs.target
+Before=citrine-first-boot.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/citrine/pool
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

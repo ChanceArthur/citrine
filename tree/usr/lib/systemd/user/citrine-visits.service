@@ -1,0 +1,10 @@
+[Unit]
+Description=Log the site's visits from the shield Worker's tail
+
+[Service]
+ExecStart=/usr/bin/dashboard --visits
+Restart=on-failure
+RestartSec=5min
+
+[Install]
+WantedBy=default.target

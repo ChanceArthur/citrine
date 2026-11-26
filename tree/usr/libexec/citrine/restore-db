@@ -1,0 +1,50 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+case ${1:?usage: restore-db r2 | drive} in
+  r2) r2_env ;;
+  drive)
+    mountpoint -q "$BACKUP_MOUNT" || die "no drive mounted at $BACKUP_MOUNT"
+    [ ! -L "$BACKUP_MOUNT/restic" ] || die "$BACKUP_MOUNT/restic is a symlink"
+    export RESTIC_REPOSITORY="$BACKUP_MOUNT/restic"
+    export RESTIC_PASSWORD
+    ;;
+  *) die "usage: restore-db r2 | drive" ;;
+esac
+
+[ -n "${DATABASES:-}" ] || die "DATABASES is empty in citrine.conf — nothing to restore"
+
+printf 'This replaces every database in DATABASES (%s) with the newest backup. Type yes: ' "$DATABASES"
+read -r answer
+[ "$answer" = yes ] || die "nothing done"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+dump_of() {
+  local f
+  for f in "$work/var/lib/citrine/dumps/citrine-$1.sql" "$work/var/tmp/citrine-$1.sql"; do
+    [ ! -s "$f" ] || { echo "$f" && return; }
+  done
+  return 1
+}
+
+restic restore latest --tag db --target "$work"
+for db in $DATABASES; do
+  dump_of "${db%%=*}" >/dev/null || die "the newest db snapshot holds no ${db%%=*} dump"
+done
+
+read -ra clients <<<"$(db_clients)"
+restart() { [ ${#clients[@]} -eq 0 ] || as_user systemctl --user start "${clients[@]}"; }
+[ ${#clients[@]} -eq 0 ] || as_user systemctl --user stop "${clients[@]}"
+trap 'restart; rm -rf "$work"' EXIT
+
+for db in $DATABASES; do
+  log "replaying ${db%%=*} into ${db#*=}"
+  sed "s/SELECT pg_catalog.set_config('search_path', '', false);/SELECT pg_catalog.set_config('search_path', 'public, pg_catalog', true);/g" \
+    "$(dump_of "${db%%=*}")" |
+    as_user podman exec -i "${db#*=}" sh -c \
+      'exec psql --dbname="$POSTGRES_DB" --username="$POSTGRES_USER" --single-transaction --set ON_ERROR_STOP=on'
+done
+
+log "restored"

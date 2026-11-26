@@ -1,0 +1,59 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+umask 077
+dumpdir=/var/lib/citrine/dumps
+dumps=()
+trap 'rm -f "${dumps[@]}"' EXIT
+
+case ${1:?usage: backup r2 | drive} in
+  r2)
+    r2_env
+    paths="/etc/citrine/secrets.env $(in_pool ${BACKUP_PATHS:-}) $(app_paths BACKUP)"
+    ;;
+  drive)
+    mountpoint -q "$BACKUP_MOUNT" || die "no drive mounted at $BACKUP_MOUNT"
+    [ ! -L "$BACKUP_MOUNT/restic" ] || die "$BACKUP_MOUNT/restic is a symlink"
+    export RESTIC_REPOSITORY="$BACKUP_MOUNT/restic"
+    export RESTIC_PASSWORD
+    paths="/etc/citrine/secrets.env $( (in_pool ${BACKUP_PATHS:-}; drive_paths) | sort -u) $(app_paths BACKUP)"
+    ;;
+  *) die "usage: backup r2 | drive" ;;
+esac
+
+repo=0
+restic cat config >/dev/null 2>&1 || repo=$?
+case $repo in
+  0) ;;
+  10) restic init ;;
+  *) restic cat config >/dev/null ;;
+esac
+
+for db in ${DATABASES:-}; do
+  name=${db%%=*} container=${db#*=}
+  install -d -m 0700 "$dumpdir"
+  dump=$dumpdir/citrine-$name.sql
+  dumps+=("$dump")
+  log "dumping $container"
+  as_user podman exec "$container" sh -c \
+    'exec pg_dump --clean --if-exists --dbname="$POSTGRES_DB" --username="$POSTGRES_USER"' >"$dump"
+  grep -q '^-- PostgreSQL database dump complete' "$dump" ||
+    die "pg_dump of $container did not finish — refusing to store a truncated dump"
+done
+
+[ ${#dumps[@]} -eq 0 ] || restic backup --tag db "${dumps[@]}"
+
+excludes=
+for e in $(in_pool ${BACKUP_EXCLUDE:-}) $(app_paths BACKUP_EXCLUDE); do excludes="$excludes --exclude=$e"; done
+
+present=
+for p in $paths; do
+  if [ -e "$p" ]; then present="$present $p"; else log "skipping $p, which isn't there yet"; fi
+done
+
+log "backing up$present"
+# shellcheck disable=SC2086
+restic backup --tag files $excludes $present
+
+restic forget $BACKUP_KEEP --prune --group-by host,tags
+restic snapshots --latest 1

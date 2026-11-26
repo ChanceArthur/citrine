@@ -1,0 +1,12 @@
+[Unit]
+Description=Sync the site if its repository is ahead of what's applied
+After=network-online.target citrine-pool.service citrine-first-boot.service
+Wants=network-online.target
+ConditionPathExists=/var/lib/citrine/first-boot.done
+
+[Service]
+Type=oneshot
+TimeoutStartSec=2min
+SyslogLevel=notice
+LogLevelMax=notice
+ExecStart=/usr/libexec/citrine/site poll

@@ -1,0 +1,7 @@
+[Unit]
+Description=Builds of the site's own images, kept from crowding the site
+
+[Slice]
+CPUWeight=idle
+MemoryHigh=40%
+MemoryMax=50%

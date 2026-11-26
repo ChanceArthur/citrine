@@ -1,0 +1,6 @@
+[Unit]
+Description=Reboot into a staged Citrine
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/citrine/auto-reboot

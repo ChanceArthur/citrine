@@ -1,0 +1,329 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+state=/var/lib/citrine
+checkout=$state/site
+key=/etc/citrine/site.key
+env=/etc/citrine/env
+quadlets=/etc/containers/systemd/users/$USER_UID
+manifest=$state/site-units
+applied=$state/site-applied
+
+[ -n "${SITE_REPO:-}" ] || die "no SITE_REPO — /etc/citrine/site.conf is missing or empty"
+shopt -s nullglob
+install -d "$state"
+exec 9>"$state/site.lock"
+[ "${1:-}" = poll ] || flock 9
+
+case $SITE_REPO in
+  https://*) export GIT_TERMINAL_PROMPT=0 ;;
+  *)
+    [ -r "$key" ] || die "no $key to fetch the site with"
+    export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes -o UserKnownHostsFile=/usr/lib/citrine/known_hosts -o StrictHostKeyChecking=yes"
+    ;;
+esac
+
+fetch() {
+  [ -d "$checkout/.git" ] || git init -q "$checkout"
+  git -C "$checkout" remote remove origin 2>/dev/null || true
+  git -C "$checkout" remote add origin "$SITE_REPO"
+  git -C "$checkout" sparse-checkout set "$SITE_DIR"
+  git -C "$checkout" fetch -q --depth 1 origin "$SITE_REF"
+  git -C "$checkout" checkout -q --force --detach FETCH_HEAD
+}
+
+poll() {
+  local remote at
+  remote=$(git ls-remote "$SITE_REPO" "$SITE_REF" | awk 'NR == 1 { print $1 }')
+  [ -n "$remote" ] || die "the site's repository has no $SITE_REF"
+  [ "$remote" != "$(cut -d' ' -f1 "$applied" 2>/dev/null)" ] || return 0
+  if [ "$(systemctl show -P Result citrine-site.service)" != success ] &&
+    [ "$remote" = "$(git -C "$checkout" rev-parse -q --verify HEAD 2>/dev/null)" ]; then
+    at=$(systemctl show -P InactiveEnterTimestamp --timestamp=unix citrine-site.service)
+    [ -z "$at" ] || [ $(($(date +%s) - ${at#@})) -ge 3600 ] || return 0
+  fi
+  log "$SITE_REF is at ${remote:0:7}, which isn't applied — syncing the site"
+  systemctl start --no-block citrine-site.service
+}
+
+marker() {
+  printf '%s %s\n' "$(git -C "$checkout" rev-parse HEAD)" "$(grep '^VERSION=' /usr/lib/citrine-release)"
+}
+
+put() {
+  cmp -s "$1" "$2" && return 1
+  [ -d "${2%/*}" ] || install -d -m 0755 "${2%/*}"
+  install -m "$3" "$1" "$2"
+}
+
+registry() {
+  local home=/var/home/$USER_NAME
+  printf '{"auths":{"ghcr.io":{"auth":"%s"}}}\n' \
+    "$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)" >"$stage/auth.json"
+  put "$stage/auth.json" /etc/ostree/auth.json 0600 || true
+  [ -d "$home" ] || return 0
+  as_user bash -c 'umask 077 && mkdir -p "${1%/*}" && a=$(cat) && { [ "$a" = "$(cat "$1" 2>/dev/null)" ] || printf "%s\n" "$a" >"$1"; }' \
+    _ "$home/.config/containers/auth.json" <"$stage/auth.json" || log "couldn't give $USER_NAME the GHCR credential"
+}
+
+wait_user() {
+  for _ in $(seq 120); do
+    [ -S "/run/user/$USER_UID/bus" ] && return 0
+    sleep 1
+  done
+  die "$USER_NAME's systemd isn't up, so the site's images can't be built yet"
+}
+
+tree_of() {
+  local spec=HEAD:$1 id
+  [ "$1" != . ] || spec='HEAD^{tree}'
+  id=$(git -C "$checkout" rev-parse -q --verify "$spec" 2>/dev/null) &&
+    [ "$(git -C "$checkout" cat-file -t "$id")" = tree ] && echo "$id"
+}
+
+image_tree() {
+  as_user podman image inspect --format '{{index .Labels "citrine.tree"}}' "localhost/$1:latest" 2>/dev/null || true
+}
+
+built() {
+  local pair tree
+  [ -z "$nobuild" ] && [ -n "${BUILD:-}" ] || return 0
+  wait_user
+  for pair in $BUILD; do
+    tree=$(tree_of "${pair#*=}") || return 1
+    [ "$(image_tree "${pair%%=*}")" = "$tree" ] || return 1
+  done
+}
+
+build() {
+  local name=${1%%=*} path=${1#*=} tree dir
+  tree=$(tree_of "$path") || die "BUILD names $path for $name, which isn't a folder in the site's repository"
+  [ "$(image_tree "$name")" != "$tree" ] || return 0
+  dir=$(as_user mktemp -d -p /var/tmp citrine-build.XXXXXX)
+  log "building $name from $path"
+  if ! (umask 022 && git -C "$checkout" archive --format=tar "$tree" | as_user tar -x -C "$dir") ||
+    ! as_user systemd-run --user --quiet --wait --pipe --collect --slice=citrine-build.slice \
+      podman build --pull=newer --cgroup-parent=citrine-build.slice \
+      --label "citrine.tree=$tree" -t "localhost/$name:building" "$dir"; then
+    rm -rf "$dir"
+    die "couldn't build $name, so the site stays as it was"
+  fi
+  rm -rf "$dir"
+  rebuilt+=("$name")
+}
+
+promote() {
+  local image=localhost/$1
+  if as_user podman image exists "$image:latest"; then
+    as_user podman tag "$image:latest" "$image:previous"
+  fi
+  as_user podman tag "$image:building" "$image:latest"
+  as_user podman untag "$image:latest" "$image:building"
+}
+
+demote() {
+  local image=localhost/$1
+  if as_user podman image exists "$image:previous"; then
+    as_user podman tag "$image:previous" "$image:latest"
+  fi
+}
+
+runs_on() {
+  local f
+  for f in $(grep -lE "^Image=localhost/$1(:latest)?\$" "$quadlets"/*.container </dev/null); do
+    f=${f##*/}
+    echo "${f%.container}.service"
+  done
+}
+
+template_value() {
+  local name=SITE_KEY_$2
+  ! conf_secret "$2" || die "the site's env/$1 asks for $2, which is one of Citrine's own secrets"
+  if grep -q "^$2=" /etc/citrine/secrets.env 2>/dev/null; then
+    val=${!2:-}
+  elif [ "$2" = TIMEZONE ] || [ "$2" = HOSTNAME ] || conf_key "$2"; then
+    val=${!2:-}
+  else
+    val=${!name:-}
+  fi
+}
+
+fill() {
+  local line head rest key val out
+  while IFS= read -r line || [ -n "$line" ]; do
+    out=
+    case $line in
+      '#'*) ;;
+      *)
+        while [[ $line == *@* ]]; do
+          head=${line%%@*}
+          rest=${line#*@}
+          if [[ $rest =~ ^([A-Z][A-Z0-9_]*)@(.*)$ ]]; then
+            key=${BASH_REMATCH[1]}
+            line=${BASH_REMATCH[2]}
+            template_value "$1" "$key"
+            [ -n "$val" ] || die "the site's env/$1 needs $key, and it's empty"
+            out+=$head$val
+          else
+            out+=$head@
+            line=$rest
+          fi
+        done
+        ;;
+    esac
+    printf '%s\n' "$out$line"
+  done
+}
+
+trust() {
+  local dir=$checkout/$SITE_DIR problems
+  [ -f "$dir/citrine.conf" ] || die "$SITE_DIR/citrine.conf is missing from the site"
+  [ -z "$(find "$dir" -type l -print -quit)" ] || die "$SITE_DIR/ holds a symlink, which a server won't follow"
+  problems=$(conf_check "$dir/citrine.conf") || die "$problems"
+}
+
+render() {
+  local dir=$checkout/$SITE_DIR f
+  trust
+
+  umask 077
+  stage=$(mktemp -d)
+  trap 'rm -rf "$stage"' EXIT
+  cp -a "$dir/." "$stage/"
+  load "$stage/citrine.conf" /etc/citrine/secrets.env
+
+  install -d "$stage/env"
+  for f in "$stage/env"/*; do
+    fill "${f##*/}" <"$f" >"$f.filled"
+    mv "$f.filled" "$f"
+  done
+  printf 'TUNNEL_TOKEN=%s\n' "${TUNNEL_TOKEN:-}" >"$stage/env/cloudflared.env"
+  printf 'CF_API_TOKEN=%q\nCF_ZONE_ID=%q\n' "${CF_API_TOKEN:-}" "${CF_ZONE_ID:-}" >"$stage/env/dashboard.env"
+}
+
+apply() {
+  local commit f name
+  commit=$(git -C "$checkout" rev-parse --short HEAD)
+  render
+  if [ -z "$nobuild" ] && [ -n "${BUILD:-}" ]; then
+    wait_user
+    for f in $BUILD; do build "$f"; done
+  fi
+
+  local -a units=() changed=() removed=()
+  [ ! -d "$stage/units" ] || for f in "$stage/units"/*; do units+=("${f##*/}"); done
+  if [ -f "$manifest" ]; then
+    while read -r name; do
+      [[ " ${units[*]} " == *" $name "* ]] || removed+=("$name")
+    done <"$manifest"
+  fi
+
+  if [ -S "/run/user/$USER_UID/bus" ]; then
+    for name in "${removed[@]}"; do
+      [[ $name == *.container ]] && as_user systemctl --user stop "${name%.container}.service" || true
+    done
+  fi
+  for name in "${removed[@]}"; do
+    rm -f "$quadlets/$name" "$quadlets/$name.d/citrine-data.conf"
+    rmdir "$quadlets/$name.d" 2>/dev/null || true
+  done
+
+  printf '[Unit]\nRequires=citrine-data.service\nAfter=citrine-data.service\n' >"$stage/citrine-data.conf"
+  for name in "${units[@]}"; do
+    put "$stage/units/$name" "$quadlets/$name" 0644 && changed+=("$name")
+    [[ $name == *.container ]] || continue
+    if [ -n "$(unit_volumes "$stage/units/$name")" ]; then
+      put "$stage/citrine-data.conf" "$quadlets/$name.d/citrine-data.conf" 0644 &&
+        [[ " ${changed[*]} " != *" $name "* ]] && changed+=("$name")
+    elif [ -e "$quadlets/$name.d/citrine-data.conf" ]; then
+      rm -f "$quadlets/$name.d/citrine-data.conf"
+      rmdir "$quadlets/$name.d" 2>/dev/null || true
+      changed+=("$name")
+    fi
+  done
+  printf '%s\n' "${units[@]}" >"$manifest"
+  for f in "$quadlets"/*.d; do chmod 0755 "$f"; done
+
+  install -d -m 0750 -g "$USER_UID" "$env"
+  for f in "$stage/env"/*; do
+    put "$f" "$env/${f##*/}" 0640 && chown "root:$USER_UID" "$env/${f##*/}" && changed+=("${f##*/}")
+  done
+  for f in "$env"/*; do
+    [ -e "$stage/env/${f##*/}" ] || { rm -f "$f" && changed+=("${f##*/}"); }
+  done
+
+  put "$stage/citrine.conf" /etc/citrine/citrine.conf 0644 || true
+
+  [ "$(readlink /etc/localtime)" = "../usr/share/zoneinfo/$TIMEZONE" ] ||
+    ln -sf "../usr/share/zoneinfo/$TIMEZONE" /etc/localtime
+  [ -z "${GH_TOKEN:-}" ] || registry
+  ! mountpoint -q "$POOL_MOUNT" || pool_dirs
+
+  if [ -S "/run/user/$USER_UID/bus" ]; then
+    as_user systemctl --user daemon-reload
+    local -a restart=() fresh=()
+    for name in "${rebuilt[@]}"; do
+      promote "$name"
+      mapfile -t -O "${#fresh[@]}" fresh < <(runs_on "$name")
+    done
+    for name in "${changed[@]}"; do
+      if [[ $name == *.container ]]; then
+        restart+=("${name%.container}.service")
+      else
+        for f in $(grep -lF "$name" "$quadlets"/*.container </dev/null); do
+          f=${f##*/}
+          restart+=("${f%.container}.service")
+        done
+      fi
+      [ "$name" != dashboard.env ] || restart+=(citrine-visits.service)
+    done
+    if [ ${#restart[@]} -gt 0 ]; then
+      mapfile -t restart < <(printf '%s\n' "${restart[@]}" | sort -u | grep -vxF -f <(printf '%s\n' "${fresh[@]}"))
+    fi
+    if [ ${#restart[@]} -gt 0 ]; then
+      log "restarting ${restart[*]}"
+      as_user systemctl --user restart --no-block "${restart[@]}"
+    fi
+    if [ ${#fresh[@]} -gt 0 ]; then
+      mapfile -t fresh < <(printf '%s\n' "${fresh[@]}" | sort -u)
+      log "starting the new build on ${fresh[*]}"
+      if ! as_user systemctl --user restart "${fresh[@]}"; then
+        for name in "${rebuilt[@]}"; do demote "$name"; done
+        as_user systemctl --user restart --no-block "${fresh[@]}"
+        die "${fresh[*]} didn't come up on the new build of ${rebuilt[*]}, so it's back on the one before"
+      fi
+    fi
+    [ ${#rebuilt[@]} = 0 ] || as_user podman image prune -f >/dev/null || true
+  fi
+
+  marker >"$applied"
+  chmod 0644 "$applied"
+  log "applied $SITE_DIR/ at $commit${changed[*]:+ — changed ${changed[*]}}"
+}
+
+nobuild=
+rebuilt=()
+case ${1:?usage: site sync [--no-build] | poll | apply | check | render} in
+  sync)
+    [ "${2:-}" != --no-build ] || nobuild=1
+    fetch
+    /usr/libexec/citrine/setup save || true
+    while :; do
+      if [ "$(marker)" != "$(cat "$applied" 2>/dev/null)" ] || ! built; then
+        apply
+      fi
+      head=$(git -C "$checkout" rev-parse HEAD)
+      fetch || break
+      [ "$(git -C "$checkout" rev-parse HEAD)" != "$head" ] || break
+      rebuilt=()
+    done
+    ;;
+  check)
+    fetch || die "couldn't fetch the site — if it's private, this machine's key has to be a deploy key on it"
+    trust
+    ;;
+  poll) poll ;;
+  apply) apply ;;
+  render) render ;;
+  *) die "usage: site sync [--no-build] | poll | apply | check | render" ;;
+esac

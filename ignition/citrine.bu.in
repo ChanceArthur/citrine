@@ -1,0 +1,83 @@
+variant: fcos
+version: 1.6.0
+
+# Template. .github/build/iso.sh fills the @…@ placeholders out of defaults.conf
+# and hands the result to butane. Everything here runs once, on plain Fedora
+# CoreOS, before the machine has ever seen Citrine: the disk, and a setup account
+# that isn't in wheel, whose password is public. It gets wheel when setup finishes.
+
+passwd:
+  groups:
+    - name: "@USER_NAME@"
+      gid: 1001
+  users:
+    - name: "@USER_NAME@"
+      uid: 1001
+      primary_group: "@USER_NAME@"
+      groups:
+        - systemd-journal
+      password_hash: "@PASSWORD_HASH@"
+
+storage:
+  disks:
+    - device: /dev/disk/by-id/coreos-boot-disk
+      wipe_table: false
+      partitions:
+        - number: 4
+          label: root
+          size_mib: 24576
+          resize: true
+        - label: citrine-var
+          size_mib: 65536
+        - label: citrine-pool0
+          size_mib: 0
+
+  filesystems:
+    - path: /var
+      device: /dev/disk/by-partlabel/citrine-var
+      format: btrfs
+      label: citrine-var
+      wipe_filesystem: true
+      mount_options:
+        - compress=zstd:1
+        - noatime
+      with_mount_unit: true
+
+  files:
+    - path: /etc/hostname
+      mode: 0644
+      contents:
+        inline: "@HOSTNAME@"
+
+    - path: /etc/citrine/site.conf
+      mode: 0644
+      contents:
+        local: site.conf
+
+  directories:
+    - path: /etc/citrine
+      mode: 0755
+
+systemd:
+  units:
+    - name: citrine-autorebase.service
+      enabled: true
+      contents: |
+        [Unit]
+        Description=Rebase this install onto Citrine
+        ConditionPathExists=!/etc/citrine/.rebased
+        After=network-online.target
+        Wants=network-online.target
+
+        [Service]
+        Type=oneshot
+        RemainAfterExit=yes
+        StandardOutput=journal+console
+        StandardError=journal+console
+        ExecStart=/usr/bin/rpm-ostree rebase --bypass-driver ostree-unverified-registry:@IMAGE@
+        ExecStart=/usr/bin/touch /etc/citrine/.rebased
+        ExecStart=/usr/bin/systemctl disable citrine-autorebase.service
+        ExecStart=/usr/bin/systemctl reboot
+
+        [Install]
+        WantedBy=multi-user.target

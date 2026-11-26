@@ -1,0 +1,11 @@
+[Unit]
+Description=Move Citrine onto its signed image
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/citrine/signed-ref
+
+[Install]
+WantedBy=multi-user.target

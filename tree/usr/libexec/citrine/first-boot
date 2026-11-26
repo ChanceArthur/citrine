@@ -1,0 +1,88 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+/usr/libexec/citrine/site sync --no-build ||
+  die "couldn't fetch the site — check SITE_REPO and, if it's private, that site.key's public half is a deploy key"
+load /etc/citrine/citrine.conf /etc/citrine/secrets.env
+
+account() {
+  for group in render video; do
+    grep -q "^$group:" /etc/group || grep "^$group:" /usr/lib/group >>/etc/group
+  done
+  usermod -aG render,video "$USER_NAME"
+
+  [ -z "${USER_PASSWORD:-}" ] ||
+    printf '%s\n%s\n' "$USER_PASSWORD" "$USER_PASSWORD" | smbpasswd -s -a "$USER_NAME"
+  setsebool -P samba_export_all_ro=on samba_export_all_rw=on
+  systemctl enable --now smb
+}
+
+tailnet() {
+  systemctl enable --now tailscaled
+
+  if tailscale status --json 2>/dev/null | jq -e '.BackendState == "Running"' >/dev/null; then
+    firewall-cmd --zone=trusted --change-interface=tailscale0 --permanent
+    firewall-cmd --reload
+    return 0
+  fi
+
+  if [ -z "${TS_AUTHKEY:-}" ]; then
+    log "TS_AUTHKEY is empty. Run 'sudo tailscale up --ssh --advertise-exit-node"
+    log "--advertise-tags=$TS_TAGS', then 'sudo /usr/libexec/citrine/first-boot' to finish."
+    return 0
+  fi
+
+  key=$TS_AUTHKEY
+  case $key in tskey-client-*) key="$key?ephemeral=false&preauthorized=true" ;; esac
+
+  file=$(umask 077 && mktemp)
+  printf '%s' "$key" >"$file"
+  tailscale up \
+    --auth-key="file:$file" \
+    --advertise-tags="$TS_TAGS" \
+    --hostname="$HOSTNAME" \
+    --ssh \
+    --advertise-exit-node || {
+    rm -f "$file"
+    die "tailscale couldn't join with TS_AUTHKEY"
+  }
+  rm -f "$file"
+
+  firewall-cmd --zone=trusted --change-interface=tailscale0 --permanent
+  firewall-cmd --reload
+}
+
+containers() {
+  loginctl enable-linger "$USER_NAME"
+  for _ in $(seq 60); do
+    [ -S "/run/user/$USER_UID/bus" ] && break
+    sleep 1
+  done
+  as_user systemctl --user enable --now podman-auto-update.timer
+  as_user systemctl --user start --no-block default.target
+}
+
+serve() {
+  tailscale status >/dev/null 2>&1 || return 0
+  for pair in $SERVE; do
+    tailscale serve --bg --https="${pair%%=*}" "${pair##*=}"
+  done
+  for pair in $SERVE_TCP; do
+    tailscale serve --bg --tcp="${pair%%=*}" "tcp://localhost:${pair##*=}"
+  done
+}
+
+updates() {
+  systemctl enable --now rpm-ostreed-automatic.timer citrine-reboot.timer
+}
+
+account
+tailnet
+containers
+serve
+updates
+citrine-app restore
+
+install -d /var/lib/citrine
+touch /var/lib/citrine/setup.done /var/lib/citrine/first-boot.done
+log "first boot done — the containers finish starting from here"

@@ -1,0 +1,11 @@
+[Unit]
+Description=Keep Citrine's containers off the host's tailnet ports
+Before=user@1001.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/libexec/citrine/containment
+
+[Install]
+WantedBy=multi-user.target

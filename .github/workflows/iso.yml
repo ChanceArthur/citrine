@@ -1,0 +1,31 @@
+name: ISO
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: iso
+  cancel-in-progress: true
+
+jobs:
+  iso:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+
+      - name: Make room for an ISO
+        run: sudo rm -rf /usr/local/lib/android /opt/ghc /usr/share/dotnet /opt/hostedtoolcache
+
+      - run: ./.github/build/iso.sh "$RUNNER_TEMP/citrine-install.iso"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=iso-$(TZ=America/New_York date +%y.%m.%d.%H%M%S)
+          gh release create "$tag" "$RUNNER_TEMP/citrine-install.iso" \
+            --title "Citrine install ISO, $tag" \
+            --notes "Installs the latest Citrine image, then waits for setup." \
+            --latest

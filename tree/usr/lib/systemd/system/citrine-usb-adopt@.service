@@ -1,0 +1,8 @@
+[Unit]
+Description=Consider /dev/%i for the Citrine data pool
+After=citrine-pool.service
+Requires=citrine-pool.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/citrine/usb-adopt %i

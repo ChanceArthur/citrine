@@ -1,0 +1,8 @@
+[Unit]
+Description=Scrub the Citrine data pool
+ConditionPathIsMountPoint=/var/mnt/data
+
+[Service]
+Type=oneshot
+IOSchedulingClass=idle
+ExecStart=/usr/sbin/btrfs scrub start -B -c 3 /var/mnt/data

@@ -1,0 +1,18 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+dev=/dev/${1:?usage: backup-drive sdX1}
+
+[ "$(lsblk -no LABEL "$dev")" = "$BACKUP_LABEL" ] ||
+  die "$dev is not labelled $BACKUP_LABEL"
+
+mkdir -p "$BACKUP_MOUNT"
+mountpoint -q "$BACKUP_MOUNT" && die "$BACKUP_MOUNT is already busy"
+
+mount -o noatime,nosuid,nodev,noexec,nosymfollow "$dev" "$BACKUP_MOUNT"
+trap 'umount "$BACKUP_MOUNT" && log "backup done — safe to unplug"' EXIT
+
+/usr/libexec/citrine/backup drive
+
+install -d /var/lib/citrine
+date -u +%FT%TZ >/var/lib/citrine/last-drive-backup

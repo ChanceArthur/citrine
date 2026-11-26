@@ -1,0 +1,7 @@
+[Unit]
+Description=Roll back a Citrine that came up broken
+ConditionPathExists=/var/lib/citrine/first-boot.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/libexec/citrine/boot-check

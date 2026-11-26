@@ -1,0 +1,146 @@
+# shellcheck shell=bash disable=SC1090
+set -euo pipefail
+
+. /usr/lib/citrine/conf.sh
+
+load() {
+  . /usr/lib/citrine/defaults.conf
+  local f
+  conf_read "${1:-}"
+  [ $# = 0 ] || shift
+  for f in "$@" /etc/citrine/site.conf; do
+    if [ -r "$f" ]; then . "$f"; fi
+  done
+}
+
+load /etc/citrine/citrine.conf /etc/citrine/secrets.env
+export RESTIC_CACHE_DIR=/var/cache/restic
+user_quadlets=/etc/containers/systemd/users/$USER_UID
+site_units=/var/lib/citrine/site-units
+
+log() { printf 'citrine: %s\n' "$*"; }
+die() {
+  printf 'citrine: %s\n' "$*" >&2
+  exit 1
+}
+
+as_user() {
+  if [ "$(id -un)" = "$USER_NAME" ]; then
+    env "XDG_RUNTIME_DIR=/run/user/$USER_UID" \
+      "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$USER_UID/bus" "$@"
+  else
+    runuser -u "$USER_NAME" -- env \
+      "XDG_RUNTIME_DIR=/run/user/$USER_UID" \
+      "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$USER_UID/bus" "$@"
+  fi
+}
+
+pool_devices() { btrfs filesystem show "$POOL_MOUNT" | grep -c 'devid'; }
+
+mirror_pool() {
+  [ "$(pool_devices)" -ge 2 ] || return 0
+  btrfs filesystem df "$POOL_MOUNT" |
+    awk '/^(Data|Metadata|System),/ && !/RAID1/ { single = 1 } END { exit single }' && return 0
+  log "converting the pool to RAID1 in the background"
+  btrfs balance start --bg -dconvert=raid1,soft -mconvert=raid1,soft "$POOL_MOUNT"
+}
+
+r2_env() {
+  [ -n "${R2_ACCOUNT_ID:-}" ] || die "R2 is not configured in secrets.env"
+  export RESTIC_REPOSITORY="s3:https://$R2_ACCOUNT_ID.r2.cloudflarestorage.com/$R2_BUCKET"
+  export AWS_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID
+  export AWS_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY
+  export AWS_DEFAULT_REGION=auto
+  export RESTIC_PASSWORD
+}
+
+in_pool() {
+  local p
+  for p in "$@"; do echo "$POOL_MOUNT/$p"; done
+}
+
+app_paths() {
+  local f p
+  for f in "$POOL_MOUNT"/citrine-apps/*; do
+    [ -f "$f" ] || continue
+    for p in $(sed -n "s/^$1=//p" "$f"); do echo "$POOL_MOUNT/$p"; done
+  done
+}
+
+is_database() {
+  local db
+  for db in ${DATABASES:-}; do
+    [ "${1##*/}" = "${db#*=}.container" ] || grep -qx "ContainerName=${db#*=}" "$1" && return 0
+  done
+  return 1
+}
+
+unit_volumes() {
+  local d
+  for d in $(sed -n "s|^Volume=$POOL_MOUNT/\([^:]*\):.*|\1|p" "$1"); do
+    if conf_fits volume "$d"; then echo "$d"; else log "skipping ${1##*/}'s volume $d: it leaves the pool" >&2; fi
+  done
+}
+
+pool_dir() {
+  local top=$POOL_MOUNT/${1%%/*}
+  case ${1%%/*} in citrine-* | .*) return 1 ;; esac
+  [ -d "$top" ] || install -d -o "$USER_UID" -g "$USER_UID" "$top"
+  as_user mkdir -p "$POOL_MOUNT/$1"
+}
+
+pool_dirs() {
+  local f d
+  for f in "$user_quadlets"/*.container; do
+    [ -f "$f" ] || continue
+    for d in $(unit_volumes "$f"); do
+      [ -d "$POOL_MOUNT/$d" ] && continue
+      if ! pool_dir "$d"; then
+        log "couldn't make $d on the pool" >&2
+      elif is_database "$f"; then
+        as_user chattr +C "$POOL_MOUNT/$d"
+      fi
+    done
+  done
+}
+
+db_clients() {
+  local f d n found=" " clients=() grew=1
+  local -a files
+  for f in "$user_quadlets"/*.container; do
+    [ -f "$f" ] && is_database "$f" && found+="$(basename "$f" .container).service "
+  done
+  while [ -n "$grew" ]; do
+    grew=
+    for f in "$user_quadlets"/*.container; do
+      [ -f "$f" ] || continue
+      n=$(basename "$f" .container).service
+      [[ $found == *" $n "* ]] && continue
+      files=("$f")
+      for d in "$f".d/*.conf; do [ -f "$d" ] && files+=("$d"); done
+      for d in $(sed -n -E 's/^(Wants|Requires|BindsTo|Requisite|PartOf)=//p' "${files[@]}"); do
+        if [[ $found == *" $d "* ]]; then
+          found+="$n " grew=1
+          clients+=("$n")
+          break
+        fi
+      done
+    done
+  done
+  echo "${clients[*]}"
+}
+
+drive_paths() {
+  local n vols
+  if [ -n "${BACKUP_DRIVE_PATHS:-}" ]; then
+    in_pool $BACKUP_DRIVE_PATHS
+    return
+  fi
+  [ -f "$site_units" ] || return 0
+  while read -r n; do
+    [[ $n == *.container ]] && [ -f "$user_quadlets/$n" ] || continue
+    is_database "$user_quadlets/$n" && continue
+    mapfile -t vols < <(unit_volumes "$user_quadlets/$n")
+    in_pool "${vols[@]}"
+  done <"$site_units"
+}

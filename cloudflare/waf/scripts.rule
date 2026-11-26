@@ -1,0 +1,13 @@
+Fake crawler or missing headers
+(
+  (ip.src.asnum in {396982 8075} and not cf.client.bot)
+  or (
+    not (@VOUCHED@)
+    and (
+      http.request.version in {"HTTP/1.0" "HTTP/1.1"}
+      or not any(lower(http.request.headers.names[*])[*] == "accept-language")
+      or not any(lower(http.request.headers.names[*])[*] == "sec-fetch-mode")
+      or (http.user_agent contains "Chrome/" and not http.user_agent contains "Ladybird/" and not any(lower(http.request.headers.names[*])[*] == "sec-ch-ua"))
+    )
+  )
+)

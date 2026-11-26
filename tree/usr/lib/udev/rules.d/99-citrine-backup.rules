@@ -1,0 +1,2 @@
+ACTION=="add", SUBSYSTEM=="block", ENV{ID_FS_LABEL}=="CITRINE-BK", \
+  TAG+="systemd", ENV{SYSTEMD_WANTS}+="citrine-backup-drive@$kernel.service"

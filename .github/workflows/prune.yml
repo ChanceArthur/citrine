@@ -1,0 +1,56 @@
+name: Prune
+
+on:
+  schedule:
+    - cron: "0 2 * * 0"
+      timezone: "America/New_York"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  KEEP: 3
+  KEEP_DAYS: 183
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Package versions
+        env:
+          GH_TOKEN: ${{ secrets.GHCR_PRUNE_TOKEN }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "GHCR_PRUNE_TOKEN is unset, so the images keep piling up."
+            echo "It wants a classic PAT with read:packages and delete:packages —"
+            echo "there is no packages:delete for GITHUB_TOKEN to be given."
+            exit 0
+          fi
+
+          for pkg in citrine; do
+            versions=$(gh api --paginate "/user/packages/container/$pkg/versions" \
+              --jq '.[]' 2>/dev/null) || {
+              echo "$pkg: nothing published"
+              continue
+            }
+
+            [ -n "$versions" ] || continue
+
+            since=$(date -u -d "$KEEP_DAYS days ago" +%FT%TZ)
+            printf '%s\n' "$versions" | jq -rs --argjson keep "$KEEP" --arg since "$since" '
+                def tags: .metadata.container.tags // [];
+                def subject: tags | map(select(test("^sha256-[0-9a-f]{64}[.]sig$"))) | first
+                  | if . then sub("^sha256-"; "sha256:") | sub("[.]sig$"; "") else null end;
+                sort_by(.created_at) | reverse
+                | (map(select(subject == null and (tags | length) > 0)) | to_entries
+                    | map(select(.key < $keep or .value.created_at >= $since or (.value | tags | index("latest")))
+                      | .value.name)) as $kept
+                | .[]
+                | select((subject // .name) as $n | $kept | index($n) | not)
+                | "\(.id) \(if (tags | length) == 0 then "untagged" else (tags | join(",")) end)"
+              ' | while read -r id tags; do
+              gh api -X DELETE "/user/packages/container/$pkg/versions/$id"
+              echo "$pkg: deleted $id ($tags)"
+            done
+          done

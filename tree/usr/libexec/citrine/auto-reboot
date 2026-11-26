@@ -1,0 +1,10 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+rpm-ostree status --json | jq -e '.deployments[0].staged == true' >/dev/null || {
+  log "nothing staged — staying up"
+  exit 0
+}
+
+log "a new Citrine is staged — rebooting into it"
+systemctl reboot

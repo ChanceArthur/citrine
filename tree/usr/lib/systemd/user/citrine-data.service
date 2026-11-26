@@ -1,0 +1,8 @@
+[Unit]
+Description=Wait for the Citrine data pool
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=5min
+ExecStart=/usr/libexec/citrine/wait-pool

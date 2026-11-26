@@ -1,0 +1,18 @@
+[Unit]
+Description=Citrine first boot
+After=network-online.target citrine-pool.service citrine-setup.service
+Wants=network-online.target
+Requires=citrine-pool.service
+ConditionPathExists=/var/lib/citrine/setup.done
+ConditionPathExists=!/var/lib/citrine/first-boot.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=30min
+ExecStart=/usr/libexec/citrine/first-boot
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

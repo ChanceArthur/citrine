@@ -1,0 +1,21 @@
+#!/bin/bash
+set -eu
+
+. /usr/lib/citrine/defaults.conf
+. /usr/lib/citrine/conf.sh
+conf_read /etc/citrine/citrine.conf
+
+[ -n "$REGISTRY" ] || {
+  echo "deploy: REGISTRY isn't set in citrine.conf" >&2
+  exit 1
+}
+
+for app in "$@"; do
+  if podman image exists "$REGISTRY/$app:latest"; then
+    podman tag "$REGISTRY/$app:latest" "$REGISTRY/$app:previous"
+  fi
+  podman pull "$REGISTRY/$app:latest"
+  systemctl --user restart "$app.service"
+done
+
+podman image prune -f >/dev/null || true

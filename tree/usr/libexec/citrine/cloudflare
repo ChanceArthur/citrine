@@ -1,0 +1,184 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+src=/usr/share/citrine/cloudflare
+state=/var/lib/citrine
+waf_deployed=$state/shield-waf-deployed
+api=https://api.cloudflare.com/client/v4
+
+[ -n "${CF_WORKERS_TOKEN:-}" ] || {
+  log "no CF_WORKERS_TOKEN in secrets.env — Citrine's Workers are deployed by hand"
+  exit 0
+}
+[ -n "${CF_ZONE_ID:-}" ] || die "no CF_ZONE_ID in secrets.env"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+printf 'Authorization: Bearer %s\n' "$CF_WORKERS_TOKEN" >"$work/auth"
+
+cf() {
+  local out
+  if out=$(curl -sS --fail-with-body -H @"$work/auth" "$@"); then
+    printf '%s\n' "$out"
+  else
+    { jq -r '.errors[]?.message' <<<"$out" 2>/dev/null || true; } | sed 's/^/cloudflare: /' >&2
+    return 1
+  fi
+}
+
+deploy_worker() {
+  local worker=$1 main=$2 file=$src/src/$2 path=$3 deployed=$state/$4
+  local date want zone name account routes pattern body id
+  date=$(sed -n 's/.*compatibilityDate: "\([0-9-]*\)".*/\1/p' "$src/cloudflare.config.ts")
+  [ -n "$date" ] || die "no compatibilityDate in $src/cloudflare.config.ts"
+  want=$(cat "$file" <(echo "$date $CF_ZONE_ID $path") | sha256sum | cut -d' ' -f1)
+  [ "$want" = "$(cat "$deployed" 2>/dev/null)" ] && return 0
+
+  zone=$(cf "$api/zones/$CF_ZONE_ID")
+  name=$(jq -r .result.name <<<"$zone")
+  account=$(jq -r .result.account.id <<<"$zone")
+
+  jq -n --arg main "$main" --arg date "$date" \
+    '{main_module: $main, compatibility_date: $date, observability: {enabled: true}}' >"$work/metadata.json"
+
+  log "deploying $worker to $name"
+  cf -X PUT "$api/accounts/$account/workers/scripts/$worker" \
+    -F "metadata=@$work/metadata.json;type=application/json" \
+    -F "$main=@$file;type=application/javascript+module" >/dev/null
+  cf -X POST "$api/accounts/$account/workers/scripts/$worker/subdomain" \
+    -H 'Content-Type: application/json' -d '{"enabled": false}' >/dev/null
+
+  routes=$(cf "$api/zones/$CF_ZONE_ID/workers/routes")
+  for pattern in "$name$path" "*.$name$path"; do
+    body=$(jq -nc --arg p "$pattern" --arg w "$worker" '{pattern: $p, script: $w}')
+    id=$(jq -r --arg p "$pattern" '.result[] | select(.pattern == $p) | .id' <<<"$routes")
+    if [ -z "$id" ]; then
+      cf -X POST "$api/zones/$CF_ZONE_ID/workers/routes" -H 'Content-Type: application/json' -d "$body" >/dev/null
+    else
+      cf -X PUT "$api/zones/$CF_ZONE_ID/workers/routes/$id" -H 'Content-Type: application/json' -d "$body" >/dev/null
+    fi
+  done
+
+  echo "$want" >"$deployed"
+  log "$worker is live on $name"
+}
+
+current() {
+  local name=$1 stable=${2%%.*} newest=${3%%.*} i extra out=
+  [[ $stable =~ ^[0-9]+$ && $newest =~ ^[0-9]+$ ]] || return 1
+  ((newest >= stable)) || newest=$stable
+  for ((i = stable - 2; i <= newest; i++)); do
+    out+="${out:+ or }http.user_agent contains \"$name/$i.\""
+  done
+  for extra in "${@:4}"; do
+    i=${extra%%.*}
+    [[ $i =~ ^[0-9]+$ ]] && ((i < stable - 2)) && [[ $out != *"\"$name/$i.\""* ]] &&
+      out+=" or http.user_agent contains \"$name/$i.\""
+  done
+  printf '%s' "$out"
+}
+
+safari() {
+  local stable=$1 newest=$2 i back=0
+  [[ $stable =~ ^[0-9]+$ && $newest =~ ^[0-9]+$ ]] || return 1
+  ((newest >= stable)) || newest=$stable
+  for ((i = newest; back < 3; i = i == 26 ? 18 : i - 1)); do
+    ((i > stable)) || back=$((back + 1))
+    printf '%s ' "$i"
+  done
+}
+
+any_of() {
+  local before=$1 after=$2 i out=
+  for i in "${@:3}"; do
+    out+="${out:+ or }http.user_agent contains \"$before$i$after\""
+  done
+  printf '%s' "$out"
+}
+
+ios_version() {
+  sed -n "s/.*<title>iOS \([0-9][0-9]*\)$1.*/\1/p" | sort -n | tail -n 1
+}
+
+chrome_version() {
+  curl -fsS "https://versionhistory.googleapis.com/v1/chrome/platforms/win/channels/$1/versions?pageSize=1&order_by=version%20desc" |
+    jq -r '.versions[0].version // ""'
+}
+
+waf_rules() {
+  local chrome firefox feed safari iphone f part key expr
+  local -a majors
+  chrome=$(current Chrome "$(chrome_version stable)" "$(chrome_version canary)") ||
+    die "Google's version history lists no Chrome version"
+  firefox=$(curl -fsS https://product-details.mozilla.org/1.0/firefox_versions.json)
+  firefox=$(current Firefox "$(jq -r '.LATEST_FIREFOX_VERSION // ""' <<<"$firefox")" \
+    "$(jq -r '.FIREFOX_NIGHTLY // ""' <<<"$firefox")" \
+    "$(jq -r '.FIREFOX_ESR // ""' <<<"$firefox")" "$(jq -r '.FIREFOX_ESR_NEXT // ""' <<<"$firefox")") ||
+    die "Mozilla's product details list no Firefox version"
+  feed=$(curl -fsS https://developer.apple.com/news/releases/rss/releases.rss)
+  safari=$(safari "$(ios_version '[.0-9]* (' <<<"$feed")" "$(ios_version '' <<<"$feed")") ||
+    die "Apple's developer releases list no iOS version"
+  read -ra majors <<<"$safari"
+  safari=$(any_of Version/ . "${majors[@]}")
+  read -ra majors <<<"$(printf '%s\n' 18 "${majors[@]}" | sort -nu | tr '\n' ' ')"
+  iphone=$(any_of "iPhone OS " _ "${majors[@]}")
+
+  for f in "$src"/waf/*.rule; do
+    expr=$(tail -n +2 "$f")
+    for part in "$src"/waf/*.part; do
+      key=$(basename "$part" .part)
+      expr=${expr//"@${key^^}@"/"($(<"$part"))"}
+    done
+    expr=${expr//@CHROME@/"($chrome)"}
+    expr=${expr//@FIREFOX@/"($firefox)"}
+    expr=${expr//@SAFARI@/"($safari)"}
+    expr=${expr//@IPHONE@/"($iphone)"}
+    [[ $expr != *@[A-Z]*@* ]] || die "${f##*/} names a part that doesn't exist"
+    expr=$(tr -s '\n ' ' ' <<<"$expr")
+    expr=${expr% }
+    [ "${#expr}" -le 4096 ] || die "${f##*/} is ${#expr} characters, and Cloudflare takes 4096"
+    jq -nc --arg ref "citrine-$(basename "$f" .rule)" --arg name "$(head -n 1 "$f")" --arg expr "$expr" \
+      '{ref: $ref, description: $name, expression: $expr, action: "block", enabled: true}'
+  done
+}
+
+deploy_waf() {
+  local want entry code
+  waf_rules >"$work/rules.jsonl"
+  want=$(cat "$work/rules.jsonl" <(echo "$CF_ZONE_ID") | sha256sum | cut -d' ' -f1)
+  [ "$want" = "$(cat "$waf_deployed" 2>/dev/null)" ] && return 0
+
+  entry=$api/zones/$CF_ZONE_ID/rulesets/phases/http_request_firewall_custom/entrypoint
+  code=$(curl -sS -o "$work/entry.json" -w '%{http_code}' -H @"$work/auth" "$entry")
+  log "deploying the WAF rules"
+  case $code in
+    200)
+      jq -n --slurpfile mine "$work/rules.jsonl" --slurpfile live "$work/entry.json" '
+        ($live[0].result.rules // []) as $rules
+        | {rules: (
+            [$rules[] | (.ref // "") as $f | select(any($mine[]; .ref == $f) | not) | {id}]
+            + [$mine[] | . as $r | ([$rules[] | select(.ref == $r.ref) | .id][0]) as $id
+                | if $id then . + {id: $id} else . end])}' >"$work/body.json"
+      cf -X PUT "$entry" -H 'Content-Type: application/json' --data @"$work/body.json" >/dev/null
+      ;;
+    404)
+      jq -n --slurpfile mine "$work/rules.jsonl" \
+        '{name: "default", kind: "zone", phase: "http_request_firewall_custom", rules: $mine}' >"$work/body.json"
+      cf -X POST "$api/zones/$CF_ZONE_ID/rulesets" -H 'Content-Type: application/json' --data @"$work/body.json" >/dev/null
+      ;;
+    *)
+      { jq -r '.errors[]?.message' "$work/entry.json" 2>/dev/null || true; } | sed 's/^/cloudflare: /' >&2
+      die "couldn't read the zone's WAF rules (HTTP $code): CF_WORKERS_TOKEN needs Zone WAF Edit on the zone"
+      ;;
+  esac
+
+  echo "$want" >"$waf_deployed"
+  log "the WAF rules are live"
+}
+
+if [ "$SHIELD" = yes ]; then
+  deploy_worker citrine-shield index.js '/*' shield-deployed
+  deploy_waf
+else
+  log "SHIELD is off — this machine doesn't deploy the shield"
+fi

@@ -1,0 +1,13 @@
+[Unit]
+Description=Deploy the shield's Worker and WAF rules to the zone if they changed
+After=network-online.target citrine-first-boot.service citrine-site.service
+Wants=network-online.target
+ConditionPathExists=/etc/citrine/secrets.env
+
+[Service]
+Type=oneshot
+TimeoutStartSec=5min
+ExecStart=/usr/libexec/citrine/cloudflare
+
+[Install]
+WantedBy=multi-user.target

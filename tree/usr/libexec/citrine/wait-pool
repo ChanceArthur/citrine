@@ -1,0 +1,10 @@
+#!/bin/bash
+. /usr/lib/citrine/defaults.conf
+
+for _ in $(seq 120); do
+  [ -e "$POOL_MOUNT/.pool-ready" ] && exit 0
+  sleep 2
+done
+
+echo "citrine: $POOL_MOUNT never came up — refusing to start on the wrong disk" >&2
+exit 1

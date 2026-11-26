@@ -1,0 +1,29 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+good_file=/var/lib/citrine/good-deployment
+good=$(cat "$good_file" 2>/dev/null || true)
+status=$(rpm-ostree status --json)
+booted=$(jq -r '.deployments[] | select(.booted) | .checksum' <<<"$status")
+[ "$booted" != "$good" ] || exit 0
+
+down=()
+mountpoint -q "$POOL_MOUNT" || down+=(pool)
+for unit in citrine-containment firewalld sshd tailscaled; do
+  systemctl -q is-active "$unit" || down+=("$unit")
+done
+
+if [ ${#down[@]} = 0 ]; then
+  printf '%s\n' "$booted" >"$good_file"
+  log "this deployment came up healthy"
+  exit 0
+fi
+
+previous=$(jq -r '.deployments | (map(.booted) | index(true)) as $b
+  | [.[$b + 1:][] | select(.staged | not)][0].checksum // empty' <<<"$status")
+[ -n "$good" ] && [ "$previous" = "$good" ] ||
+  die "down after boot: ${down[*]} — and nothing before it came up healthy to roll back to"
+
+log "down after boot: ${down[*]} — rolling back to the deployment that last came up healthy"
+rpm-ostree cleanup --pending
+rpm-ostree rollback --reboot

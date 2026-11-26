@@ -1,0 +1,19 @@
+[Unit]
+Description=Citrine setup, on this network until the tailnet takes over
+After=network-online.target citrine-pool.service firewalld.service sshd.service
+Wants=network-online.target
+Requires=citrine-pool.service
+Before=citrine-first-boot.service
+ConditionPathExists=!/var/lib/citrine/setup.done
+ConditionPathExists=!/var/lib/citrine/first-boot.done
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=10min
+ExecStart=/usr/libexec/citrine/setup boot
+StandardOutput=journal+console
+StandardError=journal+console
+
+[Install]
+WantedBy=multi-user.target

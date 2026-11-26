@@ -1,0 +1,8 @@
+[Unit]
+Description=Check Citrine came up, after the boot has settled
+
+[Timer]
+OnBootSec=10min
+
+[Install]
+WantedBy=timers.target

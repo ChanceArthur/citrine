@@ -1,0 +1,15 @@
+{
+  "files.exclude": {
+    ".vscode": true
+  },
+  "files.associations": {
+    "*.container": "properties",
+    "*.network": "properties",
+    "*.volume": "properties",
+    "*.service": "properties",
+    "*.timer": "properties",
+    "*.conf": "properties",
+    "*.bu.in": "yaml",
+    "*.Containerfile": "dockerfile"
+  }
+}

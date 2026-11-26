@@ -1,0 +1,295 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+conf=/etc/citrine/site.conf
+key=/etc/citrine/site.key
+state=/var/lib/citrine
+setup_tag=$state/setup.done
+first_tag=$state/first-boot.done
+password_tag=$state/setup-password
+hostname_tag=$state/setup-hostname
+timezone_tag=$state/setup-timezone
+features_tag=$state/setup-features
+record=$POOL_MOUNT/citrine-setup
+dropin=/etc/ssh/sshd_config.d/10-citrine-setup.conf
+mdns=/run/systemd/resolved.conf.d/citrine-setup.conf
+ts_unit=citrine-setup-tailscale.service
+
+usage='usage: setup boot | status | password | hostname <name> | timezone <zone> | features <shield> | tailscale | site <repo> | check | secrets <verb> | finish | save'
+
+[ "$(id -u)" = 0 ] || die "$usage"
+
+pending() { [ ! -e "$setup_tag" ] && [ ! -e "$first_tag" ]; }
+still_pending() { pending || die "setup has already finished"; }
+
+conf_set() {
+  touch "$conf"
+  sed -i -e "/^$1=/d" "$conf"
+  printf '%s=%s\n' "$1" "$2" >>"$conf"
+}
+
+ts_field() { tailscale status --json 2>/dev/null | jq -r "$1 // empty" 2>/dev/null || true; }
+
+ts_state() {
+  local s
+  s=$(ts_field .BackendState)
+  echo "${s:-Stopped}"
+}
+
+lock_key() {
+  tailscale lock status --json 2>/dev/null |
+    jq -r 'select(.Enabled == true and .NodeKeySigned != true) | .NodeKey // empty' 2>/dev/null || true
+}
+
+trust_tailnet() {
+  firewall-cmd --zone=trusted --change-interface=tailscale0 >/dev/null 2>&1 || true
+  firewall-cmd --zone=trusted --change-interface=tailscale0 --permanent >/dev/null 2>&1 || true
+}
+
+open_lan() {
+  install -d /etc/ssh/sshd_config.d
+  cat >"$dropin" <<EOF
+PasswordAuthentication yes
+Match User $USER_NAME
+  ForceCommand /usr/bin/dashboard --setup
+  AllowTcpForwarding no
+  AllowAgentForwarding no
+  AllowStreamLocalForwarding no
+  X11Forwarding no
+  PermitTunnel no
+EOF
+  chmod 0644 "$dropin"
+  systemctl enable --now sshd.service || true
+  systemctl reload sshd.service || systemctl restart sshd.service
+  firewall-cmd --add-service=ssh >/dev/null
+  firewall-cmd --add-service=mdns >/dev/null 2>&1 || true
+
+  install -d "${mdns%/*}"
+  printf '[Resolve]\nMulticastDNS=yes\n' >"$mdns"
+  systemctl restart systemd-resolved.service || true
+  local link
+  for link in $(ip -o route show default | awk '{ print $5 }' | sort -u); do
+    resolvectl mdns "$link" yes || true
+  done
+
+  log "setup is open on this network: ssh $USER_NAME@$HOSTNAME.local"
+  log "or at one of: $(hostname -I 2>/dev/null || true)"
+  [ -e "$password_tag" ] || log "the first password is $USER_NAME, and setup replaces it"
+}
+
+close_lan() {
+  rm -f "$dropin" "$mdns"
+  systemctl reload sshd.service || systemctl restart sshd.service || true
+  firewall-cmd --remove-service=ssh >/dev/null 2>&1 || true
+  firewall-cmd --remove-service=mdns >/dev/null 2>&1 || true
+  systemctl restart systemd-resolved.service || true
+  log "ssh is closed on this network, and open on the tailnet"
+}
+
+save() {
+  mountpoint -q "$POOL_MOUNT" || return 0
+  [ -e "$password_tag" ] || [ -e "$first_tag" ] || return 0
+  [ -r "$conf" ] || return 0
+  local hash
+  hash=$(getent shadow "$USER_NAME" | cut -d: -f2)
+  [ -n "$hash" ] || return 0
+  install -d -m 0700 -o root -g root "$record"
+  umask 077
+  grep -v '^USER_NAME=' "$conf" >"$record/site.conf" || true
+  rm -f "$record/site.key" "$record/secrets.env"
+  [ ! -r "$key" ] || cp "$key" "$record/site.key"
+  [ ! -r /etc/citrine/secrets.env ] || cp /etc/citrine/secrets.env "$record/secrets.env"
+  printf '%s\n' "$hash" >"$record/hash"
+}
+
+restored() {
+  [ -f "$record/site.conf" ] && [ -f "$record/hash" ] || return 1
+  install -d -m 0755 /etc/citrine
+  install -m 0644 "$record/site.conf" "$conf"
+  [ ! -f "$record/site.key" ] || install -m 0600 "$record/site.key" "$key"
+  [ ! -f "$record/secrets.env" ] || install -m 0600 "$record/secrets.env" /etc/citrine/secrets.env
+  usermod -p "$(cat "$record/hash")" "$USER_NAME"
+  usermod -aG wheel "$USER_NAME"
+  touch "$password_tag" "$hostname_tag" "$timezone_tag" "$features_tag"
+  load /etc/citrine/citrine.conf /etc/citrine/secrets.env
+  hostnamectl set-hostname "$HOSTNAME" || true
+  log "restored this machine's setup from the pool"
+}
+
+boot() {
+  if restored && /usr/libexec/citrine/site sync --no-build; then
+    load /etc/citrine/citrine.conf /etc/citrine/secrets.env
+    if [ -n "${TS_AUTHKEY:-}" ]; then
+      touch "$setup_tag"
+      log "the site can rejoin the tailnet by itself, so setup stays closed"
+      return 0
+    fi
+  fi
+  open_lan
+}
+
+status() {
+  local state auth repo pub
+  state=$(ts_state)
+  auth=$(ts_field .AuthURL)
+  repo=$(sed -n 's/^SITE_REPO=//p' "$conf" 2>/dev/null | tail -n1) || repo=
+  pub=
+  [ ! -r "$key" ] || pub=$(ssh-keygen -y -f "$key" 2>/dev/null || true)
+  echo "USER=$USER_NAME"
+  echo "PASSWORD=$([ -e "$password_tag" ] && echo yes || echo no)"
+  echo "HOSTNAME_SET=$([ -e "$hostname_tag" ] && echo yes || echo no)"
+  echo "HOSTNAME=$HOSTNAME"
+  echo "TIMEZONE_SET=$([ -e "$timezone_tag" ] && echo yes || echo no)"
+  echo "TIMEZONE=$TIMEZONE"
+  echo "FEATURES_SET=$([ -e "$features_tag" ] && echo yes || echo no)"
+  echo "SHIELD=$SHIELD"
+  echo "TAILSCALE=$state"
+  echo "AUTH_URL=$auth"
+  echo "TS_STARTING=$(systemctl is-active -q "$ts_unit" && echo yes || echo no)"
+  echo "TAILNET_NAME=$(ts_field .Self.DNSName | sed 's/\.$//')"
+  echo "LOCK_KEY=$(lock_key)"
+  echo "SITE_REPO=$repo"
+  echo "PUBLIC_KEY=$pub"
+  echo "POOL_USED=$(find "$POOL_MOUNT" -mindepth 1 -maxdepth 1 ! -name .pool-ready ! -name citrine-setup 2>/dev/null | grep -q . && echo yes || echo no)"
+}
+
+set_password() {
+  local pw
+  IFS= read -r pw || true
+  [ "${#pw}" -ge 8 ] || die "use at least 8 characters"
+  [ "$pw" != "$USER_NAME" ] || die "that's the temporary password"
+  printf '%s:%s\n' "$USER_NAME" "$pw" | chpasswd
+  printf '%s\n%s\n' "$pw" "$pw" | smbpasswd -s -a "$USER_NAME" >/dev/null 2>&1 ||
+    log "couldn't set the share's password"
+  touch "$password_tag"
+}
+
+set_hostname() {
+  local name=${1:-}
+  [[ $name =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]] ||
+    die "use lowercase letters, numbers and hyphens, up to 63 characters"
+  conf_set HOSTNAME "$name"
+  hostnamectl set-hostname "$name"
+  touch "$hostname_tag"
+}
+
+set_timezone() {
+  local zone=${1:-}
+  [[ $zone =~ ^[A-Za-z0-9_+-]+(/[A-Za-z0-9_+-]+)*$ ]] && [ -f "/usr/share/zoneinfo/$zone" ] ||
+    die "use a zone's full name, like America/New_York or Etc/UTC"
+  conf_set TIMEZONE "$zone"
+  touch "$timezone_tag"
+}
+
+set_features() {
+  case ${1:-} in yes | no) ;; *) die "$usage" ;; esac
+  conf_set SHIELD "$1"
+  touch "$features_tag"
+}
+
+join_tailnet() {
+  local auth_key file
+  IFS= read -r auth_key || true
+  [ "$(ts_state)" != Running ] || return 0
+  systemctl enable --now tailscaled.service
+  systemctl stop "$ts_unit" 2>/dev/null || true
+  if [ -n "$auth_key" ]; then
+    case $auth_key in
+      tskey-*) ;;
+      *) die "that isn't a Tailscale key" ;;
+    esac
+    case $auth_key in tskey-client-*) auth_key="$auth_key?ephemeral=false&preauthorized=true" ;; esac
+    umask 077
+    file=$(mktemp)
+    printf '%s' "$auth_key" >"$file"
+    local rc=0
+    tailscale up --auth-key="file:$file" --advertise-tags="$TS_TAGS" --hostname="$HOSTNAME" \
+      --ssh --advertise-exit-node --timeout=60s || rc=$?
+    rm -f "$file"
+    [ "$rc" = 0 ] || die "tailscale couldn't join with that key"
+  else
+    systemd-run --quiet --collect --unit="$ts_unit" \
+      tailscale up --hostname="$HOSTNAME" --ssh --advertise-exit-node
+  fi
+  trust_tailnet
+}
+
+set_site() {
+  local repo=${1:-}
+  [[ $repo =~ ^(git@[A-Za-z0-9.-]+:|ssh://git@[A-Za-z0-9.-]+/|https://[A-Za-z0-9.-]+/)[A-Za-z0-9._/-]+$ ]] ||
+    die "use the repository's address, like git@github.com:you/site.git or https://github.com/you/site.git"
+  conf_set SITE_REPO "$repo"
+  if [[ $repo != https://* ]] && [ ! -e "$key" ]; then
+    umask 077
+    ssh-keygen -q -t ed25519 -N "" -C "$HOSTNAME" -f "$key"
+    rm -f "$key.pub"
+  fi
+}
+
+finish() {
+  [ -e "$password_tag" ] || die "set a password first"
+  [ -e "$hostname_tag" ] || die "set a hostname first"
+  [ -e "$timezone_tag" ] || die "set a time zone first"
+  [ -e "$features_tag" ] || die "choose the features first"
+  [ "$(ts_state)" = Running ] || die "join the tailnet first"
+  [ -z "$(lock_key)" ] || die "this machine still needs signing for Tailnet Lock"
+  /usr/libexec/citrine/site check
+  /usr/libexec/citrine/site render
+  trust_tailnet
+  usermod -aG wheel "$USER_NAME"
+  touch "$setup_tag"
+  save
+  close_lan
+  systemctl start --no-block citrine-first-boot.service
+  log "setup is done"
+}
+
+case ${1:-} in
+  boot)
+    still_pending
+    boot
+    ;;
+  status)
+    still_pending
+    status
+    ;;
+  password)
+    still_pending
+    set_password
+    ;;
+  hostname)
+    still_pending
+    set_hostname "${2:-}"
+    ;;
+  timezone)
+    still_pending
+    set_timezone "${2:-}"
+    ;;
+  features)
+    still_pending
+    set_features "${2:-}"
+    ;;
+  tailscale)
+    still_pending
+    join_tailnet
+    ;;
+  site)
+    still_pending
+    set_site "${2:-}"
+    ;;
+  check)
+    still_pending
+    /usr/libexec/citrine/site check
+    ;;
+  secrets)
+    still_pending
+    shift
+    exec /usr/libexec/citrine/secrets "$@"
+    ;;
+  finish)
+    still_pending
+    finish
+    ;;
+  save) save ;;
+  *) die "$usage" ;;
+esac

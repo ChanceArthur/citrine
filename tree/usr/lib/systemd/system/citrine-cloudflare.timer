@@ -1,0 +1,9 @@
+[Unit]
+Description=Retry deploying Citrine's Workers and WAF rules
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=10min
+
+[Install]
+WantedBy=timers.target

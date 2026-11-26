@@ -1,0 +1,19 @@
+[Unit]
+Description=Cloudflare Tunnel
+
+[Container]
+Image=docker.io/cloudflare/cloudflared:latest
+ContainerName=cloudflared
+AutoUpdate=registry
+Network=edge.network
+EnvironmentFile=/etc/citrine/env/cloudflared.env
+Environment=TUNNEL_METRICS=127.0.0.1:20241
+Exec=tunnel --no-autoupdate run
+HealthCmd=CMD cloudflared tunnel ready
+Notify=healthy
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

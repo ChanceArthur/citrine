@@ -1,0 +1,15 @@
+include "/run/citrine/containment-uids.nft"
+
+table inet citrine
+delete table inet citrine
+
+table inet citrine {
+	chain output {
+		type filter hook output priority filter; policy accept;
+		meta skuid != $user_uids accept
+		ct state != new accept
+		oifname "lo" tcp dport { 22, 139, 445 } reject
+		ip daddr 100.64.0.0/10 reject
+		ip6 daddr fd7a:115c:a1e0::/48 reject
+	}
+}

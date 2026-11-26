@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the site's repository for a new commit
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

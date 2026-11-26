@@ -1,0 +1,17 @@
+Browser out of date
+not (@VOUCHED@)
+and (
+  not starts_with(http.user_agent, "Mozilla/5.0 (")
+  or not (http.user_agent contains "AppleWebKit/" or http.user_agent contains "Gecko/")
+  or not (http.user_agent contains "Safari/" or http.user_agent contains "Firefox/" or http.user_agent contains "Mobile/")
+  or lower(http.user_agent) contains "bot"
+  or lower(http.user_agent) contains "crawl"
+  or lower(http.user_agent) contains "spider"
+  or lower(http.user_agent) contains "headless"
+  or lower(http.user_agent) contains "scan"
+  or (http.user_agent contains "Windows" and not http.user_agent contains "Windows NT 10.")
+  or (http.user_agent contains "iPhone OS " and not (@IPHONE@))
+  or (http.user_agent contains "Mac OS X" and http.user_agent contains "Version/" and not (@SAFARI@))
+  or (http.user_agent contains "Chrome/" and not http.user_agent contains "SamsungBrowser/" and not http.user_agent contains "Ladybird/" and not (@CHROME@))
+  or (http.user_agent contains "Firefox/" and not (@FIREFOX@))
+)

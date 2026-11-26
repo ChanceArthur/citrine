@@ -1,0 +1,26 @@
+[Unit]
+Description=Astro
+Wants=emdash-postgres.service
+After=emdash-postgres.service
+
+[Container]
+Image=localhost/astro:latest
+ContainerName=astro
+RunInit=true
+Network=edge.network
+Network=emdash.network
+PublishPort=127.0.0.1:4321:4321
+EnvironmentFile=/etc/citrine/env/astro.env
+UserNS=keep-id:uid=1000,gid=1000
+Volume=/var/mnt/data/emdash/data:/app/data:Z
+HealthCmd=node -e "fetch('http://127.0.0.1:4321/site.webmanifest').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"
+HealthInterval=30s
+HealthStartPeriod=15s
+HealthRetries=3
+Notify=healthy
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=default.target

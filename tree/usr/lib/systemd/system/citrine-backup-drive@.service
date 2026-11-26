@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up everything to the drive on /dev/%i
+Requires=citrine-pool.service
+After=citrine-pool.service
+ConditionPathExists=/var/lib/citrine/first-boot.done
+
+[Service]
+Type=oneshot
+TimeoutStartSec=infinity
+ExecStart=/usr/libexec/citrine/backup-drive %i
+StandardOutput=journal+console

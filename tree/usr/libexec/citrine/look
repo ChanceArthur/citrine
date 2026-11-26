@@ -1,0 +1,19 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+case "${1:-}" in
+  snapshots)
+    r2_env
+    exec restic snapshots --json
+    ;;
+  pool) exec btrfs filesystem show --raw "$POOL_MOUNT" ;;
+  scrub) exec btrfs scrub status "$POOL_MOUNT" ;;
+  smart)
+    disk=${2:-}
+    [[ $disk =~ ^[a-z0-9]+$ && -e /sys/block/$disk/device ]] || die "no such disk: $disk"
+    exec smartctl --json -i -H -A "/dev/$disk"
+    ;;
+  serve) exec tailscale serve status --json ;;
+  secrets) exec /usr/libexec/citrine/secrets list ;;
+  *) die "usage: ${0##*/} snapshots | pool | scrub | smart <disk> | serve | secrets" ;;
+esac

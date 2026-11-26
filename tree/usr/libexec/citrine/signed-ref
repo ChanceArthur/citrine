@@ -1,0 +1,18 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+ref=$(rpm-ostree status --json | jq -r '.deployments[] | select(.booted) | .["container-image-reference"] // empty')
+image=${ref#ostree-unverified-registry:}
+[ "$image" != "$ref" ] || exit 0
+
+repo=$image
+[[ ${image##*/} != *:* ]] || repo=${image%:*}
+
+jq -e --arg repo "$repo" 'any(.transports.docker[$repo][]?; .type == "sigstoreSigned")' \
+  /etc/containers/policy.json >/dev/null || {
+  log "no signing policy names $repo — staying on $ref"
+  exit 0
+}
+
+log "moving onto the signed $image"
+rpm-ostree rebase "ostree-image-signed:docker://$image"

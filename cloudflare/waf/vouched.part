@@ -1,0 +1,11 @@
+(cf.client.bot and (
+  http.user_agent contains "Googlebot" or http.user_agent contains "Google-InspectionTool" or
+  http.user_agent contains "Google-Site-Verification" or http.user_agent contains "bingbot" or
+  http.user_agent contains "Applebot" or http.user_agent contains "facebookexternalhit" or
+  http.user_agent contains "Twitterbot"
+))
+or (http.user_agent contains "Safari/" and http.user_agent contains "Facebot Twitterbot")
+or starts_with(http.user_agent, "WhatsApp/")
+or lower(http.user_agent) contains "com.apple.webkit.networking"
+or (http.user_agent contains "NetworkingExtension/" and http.user_agent contains "Network/")
+or (starts_with(http.user_agent, "SafariViewService/") and http.user_agent contains "CFNetwork/")

@@ -1,0 +1,28 @@
+// A reference copy of what the tailnet policy file needs. Nothing syncs it:
+// edit it in the admin console, then mirror the change here.
+{
+	"tagOwners": {
+		"tag:server": ["autogroup:admin"],
+	},
+
+	// Replaces the default allow-all `acls` rule — delete that rule, or it still
+	// allows everything. Under it the server, which the internet reaches, can
+	// open connections to your own devices.
+	// Grants only add: here you keep everything, the exit node included; the
+	// server can only answer.
+	"grants": [
+		{"src": ["autogroup:member"], "dst": ["*"], "ip": ["*"]},
+	],
+
+	"ssh": [
+		// Tagging the server takes it out of autogroup:self, so without this
+		// rule you lose your own SSH to it. autogroup:nonroot rather than a
+		// literal username: a typo here is a locked-out server.
+		{
+			"action": "accept",
+			"src":    ["autogroup:member"],
+			"dst":    ["tag:server"],
+			"users":  ["autogroup:nonroot"],
+		},
+	],
+}

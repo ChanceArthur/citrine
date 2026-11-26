@@ -1,0 +1,41 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+disk=${1:?usage: usb-adopt sdX [force]}
+dev=/dev/$disk
+
+mountpoint -q "$POOL_MOUNT" || exit 0
+[ -e "/sys/block/$disk" ] || exit 0
+
+if btrfs filesystem show "$POOL_MOUNT" | grep -q "$dev\$"; then
+  log "$dev is already in the pool"
+  exit 0
+fi
+
+if lsblk -no LABEL "$dev" | grep -qx "$BACKUP_LABEL"; then
+  log "$dev is the backup drive — never the pool"
+  exit 0
+fi
+
+size=$(blockdev --getsize64 "$dev")
+size_gb=$((size / 1000000000))
+
+if [ "${2:-}" != force ]; then
+  [ "$POOL_ADOPT_POLICY" = never ] && exit 0
+
+  if [ "$size" -lt "$(blockdev --getsize64 "$POOL_SEED_PART")" ]; then
+    log "$dev is ${size_gb}GB, smaller than the internal disk's share of the pool — leaving it alone"
+    exit 0
+  fi
+
+  if [ "$POOL_ADOPT_POLICY" = blank ] &&
+    [ -n "$(wipefs -n -O UUID "$dev")$(lsblk -no NAME "$dev" | tail -n +2)" ]; then
+    log "$dev holds something — leaving it alone. The dashboard's Storage tab adopts it anyway."
+    exit 0
+  fi
+fi
+
+log "adding $dev (${size_gb}GB) to the pool"
+btrfs device add -f "$dev" "$POOL_MOUNT"
+
+mirror_pool

@@ -1,0 +1,43 @@
+#!/bin/bash
+. /usr/libexec/citrine/common
+
+mkdir -p "$POOL_MOUNT"
+
+if mountpoint -q "$POOL_MOUNT"; then
+  log "pool already mounted at $POOL_MOUNT"
+  exit 0
+fi
+
+btrfs device scan >/dev/null
+
+pool_ready() {
+  dev=$(blkid -t "LABEL=$POOL_LABEL" -o device 2>/dev/null | head -n1) &&
+    btrfs device ready "$dev" 2>/dev/null
+}
+
+waited=0
+until pool_ready || [ "$waited" -ge "$POOL_WAIT_SEC" ]; do
+  [ "$waited" -gt 0 ] || log "waiting up to ${POOL_WAIT_SEC}s for every disk in the pool"
+  sleep 1
+  waited=$((waited + 1))
+done
+
+mount_pool() {
+  mount -o compress=zstd:1,noatime "$1" "$POOL_MOUNT" 2>/dev/null ||
+    mount -o degraded,rw,compress=zstd:1,noatime "$1" "$POOL_MOUNT"
+}
+
+if blkid -t "LABEL=$POOL_LABEL" -o device >/dev/null 2>&1; then
+  log "found an existing $POOL_LABEL pool — adopting it"
+  mount_pool "LABEL=$POOL_LABEL"
+else
+  [ -b "$POOL_SEED_PART" ] || die "no pool and no $POOL_SEED_PART to make one on"
+  log "no pool anywhere — making one on $POOL_SEED_PART"
+  mkfs.btrfs -f -L "$POOL_LABEL" "$POOL_SEED_PART"
+  mount_pool "$POOL_SEED_PART"
+fi
+
+pool_dirs
+
+touch "$POOL_MOUNT/.pool-ready"
+log "pool ready: $(btrfs filesystem usage -g "$POOL_MOUNT" | sed -n '2p' | tr -s ' ')"
