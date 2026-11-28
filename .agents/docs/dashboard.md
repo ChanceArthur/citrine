@@ -46,6 +46,10 @@ machine, lands in it.
   however many runs ago.
 - **The containers come from the quadlet files, not `podman ps`**: quadlet runs
   them with `--rm`, so a failed one is gone from `podman ps -a`.
+- **A container's terminal is `podman exec --detach-keys=`**: podman's default
+  detach keys start with ctrl+p, which then never reaches the shell's history.
+  The wrapper's `exit 0` leaves only podman's own failures nonzero, so a
+  126/127 means the image has no shell, not that the last command typed failed.
 - **A secret reaches `secrets` on stdin, never on a command line**, which `spec.stdin`
   is for: an `argv` is in `/proc`, and a transient unit's in the journal. So it runs
   directly rather than through `systemd-run`.

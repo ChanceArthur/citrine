@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -16,6 +17,7 @@ type containersTab struct {
 
 var (
 	kLogs     = bind("enter", "logs", "enter")
+	kTerminal = bind("x", "terminal", "x")
 	kRestart  = bind("r", "restart", "r")
 	kStop     = bind("s", "stop/start", "s")
 	kPull     = bind("p", "pull & restart", "p")
@@ -37,6 +39,9 @@ func (c *containersTab) keys(a *app) []key.Binding {
 	ct, ok := c.current(a)
 	if ok && c.built(a, ct) != "" {
 		out[3] = kBuild
+	}
+	if ok && ct.running {
+		out = append(out[:1], append([]key.Binding{kTerminal}, out[1:]...)...)
 	}
 	if ok && c.ours(a, ct) && hasTag(a.s.images.val, c.previous(a, ct)) {
 		out = append(out, kRollback)
@@ -126,6 +131,14 @@ func (c *containersTab) key(a *app, msg tea.KeyPressMsg) tea.Cmd {
 	switch {
 	case key.Matches(msg, kLogs):
 		return a.showLogs(source{label: name, unit: unitName, user: true})
+	case key.Matches(msg, kTerminal):
+		if !ct.running {
+			a.notify(lvWarn, name+" isn't running")
+			return nil
+		}
+		return a.terminal(exec.Command("podman", "exec", "-it", "--detach-keys=", name,
+			"/bin/sh", "-c", "if command -v bash >/dev/null; then bash; else sh; fi; exit 0"),
+			"a shell in "+name+" on "+a.host, name)
 	case key.Matches(msg, kRestart):
 		return a.confirm("Restart "+name+"?", c.impact(ct), "Restart", false, startCmd(spec{
 			key: "restart:" + unitName, title: "Restart " + name, user: true,

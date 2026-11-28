@@ -65,8 +65,11 @@ type dialog struct {
 type (
 	tickMsg   time.Time
 	frameMsg  struct{}
-	shellDone struct{ err error }
-	unlocked  struct {
+	shellDone struct {
+		err  error
+		into string
+	}
+	unlocked struct {
 		err  error
 		then tea.Cmd
 	}
@@ -496,6 +499,14 @@ func (a *app) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return a, tea.Batch(msg.then, a.schedule(true))
 
 	case shellDone:
+		if msg.into != "" && msg.err != nil {
+			var exit *exec.ExitError
+			if errors.As(msg.err, &exit) && (exit.ExitCode() == 126 || exit.ExitCode() == 127) {
+				a.notify(lvBad, msg.into+" has no shell")
+			} else {
+				a.notify(lvBad, "couldn't open a shell in "+msg.into+": "+errText(msg.err))
+			}
+		}
 		return a, a.schedule(true)
 
 	case tea.MouseWheelMsg:
@@ -742,8 +753,12 @@ func (a *app) shell() tea.Cmd {
 	if sh == "" {
 		sh = "/bin/bash"
 	}
-	banner := "\n" + a.t.wordmark() + a.t.dim("  a shell on "+a.host+" — exit returns to the dashboard") + "\n\n"
-	return tea.Exec(&shellCmd{cmd: exec.Command(sh), banner: banner}, func(err error) tea.Msg { return shellDone{err} })
+	return a.terminal(exec.Command(sh), "a shell on "+a.host, "")
+}
+
+func (a *app) terminal(cmd *exec.Cmd, where, into string) tea.Cmd {
+	banner := "\n" + a.t.wordmark() + a.t.dim("  "+where+" — exit returns to the dashboard") + "\n\n"
+	return tea.Exec(&shellCmd{cmd: cmd, banner: banner}, func(err error) tea.Msg { return shellDone{err, into} })
 }
 
 func (a *app) View() tea.View {
